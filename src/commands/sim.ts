@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Command } from 'commander';
+import YAML from 'yaml';
 import type {
   OpenHwProject,
   SimulationRunOptions,
@@ -18,6 +19,15 @@ import { loadProject, summarizeProject, validateProject } from '../utils/project
 import { BOARD_DEFAULT_BAUD, normalizeBoardKind } from '../utils/boards.js';
 import { getManifestInfo } from '../utils/manifests.js';
 import { FRONTEND_ROOT, relToCwd, resolveWorkspacePath } from '../utils/paths.js';
+import {
+  buildProfileEvents,
+  componentInputSchemaForProject,
+  diffBoardPins,
+  diffComponentStates,
+  evaluateAssertions,
+  extractDisplayStates,
+  normalizeBoardPinStates,
+} from '../sim/agent-observability.js';
 
 function printJson(data: unknown): void {
   process.stdout.write(`${JSON.stringify(data, null, 2)}\n`);
@@ -37,6 +47,90 @@ function parseNonNegative(input: string | undefined, fallback: number): number {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+function healthIcon(status: 'ok' | 'warn' | 'error'): string {
+  if (status === 'error') return '🔴';
+  if (status === 'warn') return '🟡';
+  return '🟢';
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function formatTelemetryLeaf(value: unknown): string {
+  if (value === null || value === undefined) return 'null';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) return `[${value.length}]`;
+  if (typeof value === 'object') {
+    const keys = Object.keys(value as Record<string, unknown>);
+    return `{${keys.slice(0, 5).join(',')}${keys.length > 5 ? ',...' : ''}}`;
+  }
+  return String(value);
+}
+
+function formatCustomTelemetry(custom: Record<string, unknown> | null): string {
+  if (!custom) return '';
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(custom)) {
+    parts.push(`${key}=${formatTelemetryLeaf(value)}`);
+    if (parts.length >= 6) break;
+  }
+  return parts.join(', ');
+}
+
+function formatTiming(universalMetrics?: Record<string, unknown>): string {
+  const timing = asRecord(universalMetrics?.timing);
+  if (!timing) return '';
+  const avgMs = Number(timing.avgMs);
+  const maxMs = Number(timing.maxMs);
+  if (!Number.isFinite(avgMs) && !Number.isFinite(maxMs)) return '';
+  const avgText = Number.isFinite(avgMs) ? avgMs.toFixed(3) : 'n/a';
+  const maxText = Number.isFinite(maxMs) ? maxMs.toFixed(3) : 'n/a';
+  return `avg=${avgText}ms max=${maxText}ms`;
+}
+
+function printTelemetryTextReport(
+  telemetry: SimulationTelemetryReport,
+  projectFile: string,
+  outputFile?: string
+): void {
+  const problematic = telemetry.components.filter((c) => c.status !== 'ok');
+  process.stdout.write(`Telemetry report for ${relToCwd(resolveWorkspacePath(projectFile))}\n`);
+  process.stdout.write(
+    `Components=${telemetry.components.length} Boards=${telemetry.boards.length} Faults=${telemetry.faults} SerialChars=${telemetry.serialChars} Problematic=${problematic.length}\n`
+  );
+  if (outputFile) {
+    process.stdout.write(`Output=${relToCwd(resolveWorkspacePath(outputFile))}\n`);
+  }
+
+  for (const component of telemetry.components) {
+    const icon = healthIcon(component.status);
+    const timing = formatTiming(component.universalMetrics);
+
+    const telemetryData = asRecord(component.telemetryData);
+    const custom = asRecord(
+      telemetryData?.customTelemetry
+      ?? telemetryData?.custom
+      ?? asRecord(component.universalMetrics)?.custom
+    );
+    const customText = formatCustomTelemetry(custom);
+    const summary = String(component.outputSummary || component.telemetrySummary || '').trim();
+
+    process.stdout.write(`${icon} ${component.id} (${component.type})${timing ? ` [${timing}]` : ''}\n`);
+    if (summary) {
+      process.stdout.write(`  summary: ${summary}\n`);
+    }
+    if (customText) {
+      process.stdout.write(`  custom: ${customText}\n`);
+    }
+    if (component.notes.length > 0) {
+      process.stdout.write(`  notes: ${component.notes.join(' | ')}\n`);
+    }
+  }
 }
 
 function parseCsvList(input: string | undefined): string[] {
@@ -393,6 +487,13 @@ async function writeOutputFile(targetPath: string, content: string): Promise<voi
   await fs.writeFile(absolute, content, 'utf8');
 }
 
+async function parseScenarioFile(inputPath: string): Promise<unknown> {
+  const absolute = resolveWorkspacePath(inputPath);
+  const raw = await fs.readFile(absolute, 'utf8');
+  const ext = path.extname(absolute).toLowerCase();
+  return ext === '.yaml' || ext === '.yml' ? YAML.parse(raw) : JSON.parse(raw);
+}
+
 async function runForDuration(
   project: Awaited<ReturnType<typeof loadProject>>,
   runOptions: SimulationRunOptions
@@ -586,6 +687,8 @@ export function registerSimCommands(program: Command, getBackendUrl: () => strin
     .option('--duration-ms <ms>', 'Run duration before telemetry report', '2500')
     .option('--debug <mode>', 'Debug mode: off|text|json', 'off')
     .option('--baud <baud>', 'Serial baud override')
+    .option('--watch', 'Stream one-line component telemetry updates until Ctrl+C')
+    .option('--interval-ms <ms>', 'Refresh interval for --watch mode', '1000')
     .option('--json', 'Print telemetry only as JSON')
     .option('--output <file>', 'Write telemetry report to JSON file')
     .option('--fail-on-warn', 'Exit non-zero when any component status is warn/error')
@@ -608,33 +711,76 @@ export function registerSimCommands(program: Command, getBackendUrl: () => strin
         baudRate: resolveDefaultBaud(selectedBoard?.type || project.board, options.baud),
       };
 
-      const { telemetry } = await runForDuration(project, runOptions);
+      if (!options.watch) {
+        const { telemetry } = await runForDuration(project, runOptions);
+
+        if (options.output) {
+          await writeOutputFile(options.output, `${JSON.stringify(telemetry, null, 2)}\n`);
+        }
+
+        if (options.json) {
+          printJson(telemetry);
+        } else {
+          printTelemetryTextReport(telemetry, projectFile, options.output);
+        }
+
+        if (options.failOnWarn && telemetry.components.some((c) => c.status !== 'ok')) {
+          process.exitCode = 1;
+        }
+        return;
+      }
+
+      const intervalMs = Math.max(250, parsePositiveInt(options.intervalMs, 1000));
+      const controller = await startSimulation(
+        project,
+        {
+          ...runOptions,
+          durationMs: 0,
+        },
+        {
+          suppressConsoleOutput: true,
+        }
+      );
+
+      let latestTelemetry = controller.getTelemetryReport();
+      const render = () => {
+        latestTelemetry = controller.getTelemetryReport();
+        if (options.json) {
+          printJson(latestTelemetry);
+          return;
+        }
+        console.clear();
+        printTelemetryTextReport(latestTelemetry, projectFile, options.output);
+      };
+
+      if (!options.json) {
+        process.stdout.write('Telemetry watch mode active. Press Ctrl+C to stop.\n');
+      }
+      render();
+      const timer = setInterval(render, intervalMs);
+
+      await new Promise<void>((resolve) => {
+        const onSigint = () => {
+          process.off('SIGINT', onSigint);
+          resolve();
+        };
+        process.on('SIGINT', onSigint);
+      });
+
+      clearInterval(timer);
+      controller.stop();
+      latestTelemetry = controller.getTelemetryReport();
 
       if (options.output) {
-        await writeOutputFile(options.output, `${JSON.stringify(telemetry, null, 2)}\n`);
+        await writeOutputFile(options.output, `${JSON.stringify(latestTelemetry, null, 2)}\n`);
       }
 
-      if (options.json) {
-        printJson(telemetry);
-      } else {
-        const problematic = telemetry.components.filter((c) => c.status !== 'ok');
-        printJson({
-          ok: true,
-          action: 'sim.telemetry',
-          file: relToCwd(resolveWorkspacePath(projectFile)),
-          summary: {
-            components: telemetry.components.length,
-            boards: telemetry.boards.length,
-            faults: telemetry.faults,
-            serialChars: telemetry.serialChars,
-            problematic: problematic.map((c) => ({ id: c.id, status: c.status, notes: c.notes })),
-          },
-          telemetry,
-          output: options.output ? relToCwd(resolveWorkspacePath(options.output)) : null,
-        });
+      if (!options.json) {
+        process.stdout.write('\nTelemetry watch stopped. Final snapshot:\n');
+        printTelemetryTextReport(latestTelemetry, projectFile, options.output);
       }
 
-      if (options.failOnWarn && telemetry.components.some((c) => c.status !== 'ok')) {
+      if (options.failOnWarn && latestTelemetry.components.some((c) => c.status !== 'ok')) {
         process.exitCode = 1;
       }
     });
@@ -1044,6 +1190,281 @@ export function registerSimCommands(program: Command, getBackendUrl: () => strin
     });
 
   sim
+    .command('probe <projectFile>')
+    .description('Inject one input/profile and return before/after component+pin+display behavior diff')
+    .requiredOption('--component-id <id>', 'Target component id')
+    .option('--board-id <id>', 'Board component id to run')
+    .option('--all-boards', 'Run all boards in project')
+    .option('--duration-ms <ms>', 'Total probe runtime', '1800')
+    .option('--at-ms <ms>', 'When to inject event', '250')
+    .option('--event <name>', 'Event name (e.g. input, SET_ATTR, press)')
+    .option('--value <value>', 'Event value (number/string/json)')
+    .option('--key <key>', 'Event key for SET_ATTR payloads')
+    .option('--event-json <json>', 'Full event JSON payload')
+    .option('--event-file <file>', 'Path to JSON event payload file')
+    .option('--profile <name>', 'Sensor profile name from sim capabilities')
+    .option('--assertions-file <file>', 'JSON/YAML assertions file')
+    .option('--output <file>', 'Write full probe payload JSON')
+    .action(async (projectFile: string, options: any) => {
+      const project = await loadProject(projectFile);
+      const boardSummary = summarizeProject(project).boards as Array<{ id: string; type: string }>;
+      const selectedBoard = options.boardId
+        ? boardSummary.find((b) => b.id === options.boardId)
+        : boardSummary.length === 1
+          ? boardSummary[0]
+          : undefined;
+
+      const componentId = String(options.componentId || '').trim();
+      const targetComponent = project.components.find((entry) => entry.id === componentId);
+      if (!targetComponent) {
+        throw new Error(`Component not found: ${componentId}`);
+      }
+
+      const durationMs = Math.max(1, parsePositiveInt(options.durationMs, 1800));
+      const eventAtMs = Math.min(durationMs, parseNonNegative(options.atMs, 250));
+
+      const runOptions: SimulationRunOptions = {
+        backendUrl: getBackendUrl(),
+        boardId: options.boardId,
+        allBoards: !!options.allBoards,
+        durationMs,
+        debugMode: 'off',
+        telemetryMode: 'off',
+        baudRate: resolveDefaultBaud(selectedBoard?.type || project.board, options.baud),
+      };
+
+      const controller = await startSimulation(project, runOptions, { suppressConsoleOutput: true });
+      if (eventAtMs > 0) {
+        await sleep(eventAtMs);
+      }
+
+      const beforeSnapshot = controller.getSnapshot();
+      const beforeTelemetry = controller.getTelemetryReport();
+
+      const eventsToInject: Array<{ atMs: number; event: unknown }> = [];
+      if (options.profile) {
+        eventsToInject.push(...buildProfileEvents(String(options.profile), targetComponent.type, durationMs));
+      } else {
+        eventsToInject.push({
+          atMs: eventAtMs,
+          event: await resolveEventInput({
+            eventJson: options.eventJson,
+            eventFile: options.eventFile,
+            event: options.event,
+            value: options.value,
+            key: options.key,
+          }),
+        });
+      }
+
+      let delivered = true;
+      let cursorMs = eventAtMs;
+      for (const entry of eventsToInject.sort((a, b) => a.atMs - b.atMs)) {
+        const waitMs = Math.max(0, entry.atMs - cursorMs);
+        if (waitMs > 0) await sleep(waitMs);
+        delivered = controller.sendComponentEvent(componentId, entry.event) && delivered;
+        cursorMs = entry.atMs;
+      }
+
+      const remainingMs = Math.max(0, durationMs - cursorMs);
+      if (remainingMs > 0) await sleep(remainingMs);
+      controller.stop();
+
+      const afterSnapshot = controller.getSnapshot();
+      const telemetry = controller.getTelemetryReport();
+      const displays = extractDisplayStates(afterSnapshot, telemetry);
+      const payload: Record<string, unknown> = {
+        ok: delivered,
+        action: 'sim.probe',
+        file: relToCwd(resolveWorkspacePath(projectFile)),
+        componentId,
+        delivered,
+        injected: eventsToInject,
+        pinState: normalizeBoardPinStates(afterSnapshot),
+        displays,
+        diff: {
+          boardPins: diffBoardPins(beforeSnapshot, afterSnapshot),
+          components: diffComponentStates(beforeSnapshot, afterSnapshot, componentId),
+          displays: {
+            before: extractDisplayStates(beforeSnapshot, beforeTelemetry),
+            after: displays,
+          },
+        },
+        targetTelemetry: telemetry.components.find((entry) => entry.id === componentId) || null,
+      };
+
+      if (options.assertionsFile) {
+        const checksRaw = await parseScenarioFile(String(options.assertionsFile));
+        const checksRoot = (checksRaw && typeof checksRaw === 'object') ? (checksRaw as Record<string, unknown>) : {};
+        const checks = Array.isArray(checksRoot.assertions) ? checksRoot.assertions : checksRaw;
+        payload.assertions = evaluateAssertions({
+          checks: Array.isArray(checks) ? checks : [],
+          displays,
+          telemetry,
+          snapshot: afterSnapshot,
+        });
+        if ((payload.assertions as { ok?: boolean }).ok === false) {
+          process.exitCode = 1;
+        }
+      }
+
+      if (options.output) {
+        await writeOutputFile(options.output, `${JSON.stringify(payload, null, 2)}\n`);
+      }
+
+      printJson({
+        ...payload,
+        output: options.output ? relToCwd(resolveWorkspacePath(options.output)) : null,
+      });
+
+      if (!delivered) {
+        process.exitCode = 1;
+      }
+    });
+
+  sim
+    .command('display <projectFile>')
+    .description('Run simulation and return normalized display-focused state snapshots')
+    .option('--board-id <id>', 'Board component id to run')
+    .option('--all-boards', 'Run all boards in project')
+    .option('--duration-ms <ms>', 'Run duration before capture', '1400')
+    .option('--output <file>', 'Write display payload JSON')
+    .action(async (projectFile: string, options: any) => {
+      const project = await loadProject(projectFile);
+      const runOptions: SimulationRunOptions = {
+        backendUrl: getBackendUrl(),
+        boardId: options.boardId,
+        allBoards: !!options.allBoards,
+        durationMs: Math.max(1, parsePositiveInt(options.durationMs, 1400)),
+        debugMode: 'off',
+        telemetryMode: 'off',
+      };
+
+      const { telemetry, snapshot } = await runForDuration(project, runOptions);
+      const displays = extractDisplayStates(snapshot, telemetry);
+      const payload = {
+        ok: true,
+        action: 'sim.display',
+        file: relToCwd(resolveWorkspacePath(projectFile)),
+        count: displays.length,
+        displays,
+      };
+
+      if (options.output) {
+        await writeOutputFile(options.output, `${JSON.stringify(payload, null, 2)}\n`);
+      }
+
+      printJson({
+        ...payload,
+        output: options.output ? relToCwd(resolveWorkspacePath(options.output)) : null,
+      });
+    });
+
+  sim
+    .command('scenario <projectFile>')
+    .description('Run repeatable simulation scenario with timed inputs and assertions from JSON/YAML')
+    .requiredOption('--scenario <file>', 'Scenario JSON/YAML file path')
+    .option('--output <file>', 'Write scenario report JSON')
+    .action(async (projectFile: string, options: any) => {
+      const project = await loadProject(projectFile);
+      const scenario = (await parseScenarioFile(String(options.scenario))) as Record<string, unknown>;
+      const durationMs = Math.max(1, parsePositiveInt(String(scenario?.durationMs || '1800'), 1800));
+      const runOptions: SimulationRunOptions = {
+        backendUrl: getBackendUrl(),
+        boardId: typeof scenario?.boardId === 'string' ? scenario.boardId : undefined,
+        allBoards: !!scenario?.allBoards,
+        durationMs,
+        debugMode: 'off',
+        telemetryMode: 'off',
+      };
+
+      const controller = await startSimulation(project, runOptions, { suppressConsoleOutput: true });
+      const inputs = Array.isArray(scenario?.inputs) ? (scenario.inputs as Array<Record<string, unknown>>) : [];
+      let cursorMs = 0;
+      let deliveredAll = true;
+
+      for (const input of inputs.sort((a, b) => Number(a?.atMs || 0) - Number(b?.atMs || 0))) {
+        const atMs = Math.max(0, Math.min(durationMs, Number(input?.atMs || 0)));
+        const waitMs = Math.max(0, atMs - cursorMs);
+        if (waitMs > 0) await sleep(waitMs);
+        cursorMs = atMs;
+
+        const targetId = String(input?.componentId || '').trim();
+        if (!targetId) continue;
+        let eventPayload: unknown = input?.event;
+
+        if (String(input?.profile || '').trim()) {
+          const component = project.components.find((entry) => entry.id === targetId);
+          if (component) {
+            const profileEvents = buildProfileEvents(String(input.profile), component.type, durationMs);
+            for (const profileEvent of profileEvents) {
+              const profileWaitMs = Math.max(0, profileEvent.atMs - cursorMs);
+              if (profileWaitMs > 0) await sleep(profileWaitMs);
+              cursorMs = profileEvent.atMs;
+              deliveredAll = controller.sendComponentEvent(targetId, profileEvent.event) && deliveredAll;
+            }
+            continue;
+          }
+        }
+
+        if (input && typeof input === 'object' && !eventPayload) {
+          eventPayload = {
+            type: input.eventName || 'input',
+            value: input.value,
+            ...(input.key ? { key: input.key } : {}),
+          };
+        }
+
+        deliveredAll = controller.sendComponentEvent(targetId, eventPayload) && deliveredAll;
+      }
+
+      const remainingMs = Math.max(0, durationMs - cursorMs);
+      if (remainingMs > 0) await sleep(remainingMs);
+      controller.stop();
+
+      const snapshot = controller.getSnapshot();
+      const telemetry = controller.getTelemetryReport();
+      const displays = extractDisplayStates(snapshot, telemetry);
+      const checks = Array.isArray(scenario?.assertions) ? scenario.assertions : [];
+      const assertions = evaluateAssertions({
+        checks,
+        displays,
+        telemetry,
+        snapshot,
+      });
+
+      const payload = {
+        ok: deliveredAll && assertions.ok,
+        action: 'sim.scenario',
+        file: relToCwd(resolveWorkspacePath(projectFile)),
+        scenario: relToCwd(resolveWorkspacePath(options.scenario)),
+        durationMs,
+        deliveredAll,
+        assertions,
+        pinState: normalizeBoardPinStates(snapshot),
+        displays,
+        telemetrySummary: {
+          faults: telemetry.faults,
+          serialChars: telemetry.serialChars,
+          nonOk: telemetry.components.filter((entry) => entry.status !== 'ok').map((entry) => entry.id),
+        },
+      };
+
+      if (options.output) {
+        await writeOutputFile(options.output, `${JSON.stringify(payload, null, 2)}\n`);
+      }
+
+      printJson({
+        ...payload,
+        output: options.output ? relToCwd(resolveWorkspacePath(options.output)) : null,
+      });
+
+      if (!payload.ok) {
+        process.exitCode = 1;
+      }
+    });
+
+  sim
     .command('screenshot <projectFile>')
     .description('Export simulation screenshot SVG for running or non-running project state')
     .requiredOption('--output <file>', 'SVG output file path')
@@ -1119,23 +1540,13 @@ export function registerSimCommands(program: Command, getBackendUrl: () => strin
     .option('--json', 'Print JSON output')
     .action(async (projectFile: string, options: { json?: boolean }) => {
       const project = await loadProject(projectFile);
-      const components = await Promise.all(
-        project.components.map(async (c) => {
-          const info = await getManifestInfo(c.type);
-          const group = info?.group || 'Other';
-          const role = classifyRole(c.type, group);
-          const templates = interactionTemplatesForType(c.type);
-          return {
-            id: c.id,
-            type: c.type,
-            label: c.label || c.id,
-            group,
-            role,
-            interactive: !!info?.hasOnEvent || templates.length > 0,
-            templates,
-          };
-        })
-      );
+      const manifestByType = new Map<string, Awaited<ReturnType<typeof getManifestInfo>>>();
+      for (const component of project.components) {
+        if (!manifestByType.has(component.type)) {
+          manifestByType.set(component.type, await getManifestInfo(component.type));
+        }
+      }
+      const components = componentInputSchemaForProject(project, manifestByType);
 
       if (options.json) {
         printJson({
