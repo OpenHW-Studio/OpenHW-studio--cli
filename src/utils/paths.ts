@@ -6,8 +6,8 @@ const __dirname = path.dirname(__filename);
 
 export const CLI_ROOT = path.resolve(__dirname, '..', '..');
 export const WORKSPACE_ROOT = path.resolve(CLI_ROOT, '..');
-export const FRONTEND_ROOT = path.join(WORKSPACE_ROOT, 'OpenHW-studio-frontend-danish');
-export const EMULATOR_ROOT = path.join(WORKSPACE_ROOT, 'openhw-studio-emulator-danish');
+export const FRONTEND_ROOT = path.join(WORKSPACE_ROOT, 'OpenHW-studio-frontend');
+export const EMULATOR_ROOT = path.join(WORKSPACE_ROOT, 'openhw-studio-emulator');
 
 // npm scripts can change process.cwd() to the package directory.
 // Prefer INIT_CWD when available so relative paths follow where the user ran the command.

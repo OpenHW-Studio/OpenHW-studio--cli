@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # OpenHW Studio CLI
 
 Terminal-first CLI for OpenHW Studio project management, headless simulation, serial monitoring, and library management.
@@ -6,7 +5,7 @@ Terminal-first CLI for OpenHW Studio project management, headless simulation, se
 ## Install
 
 ```bash
-cd openhw-studio-cli-danish
+cd openhw-studio-cli
 npm install
 ```
 
@@ -54,6 +53,10 @@ npm run cli -- project connect temp/project.json --from board1:GND --to led1:C
 # Update board code (inline or file)
 npm run cli -- project set-code temp/project.json --board-id board1 --code-file examples/blink.ino
 
+# Set block-coding metadata (Blockly XML + generated code preference)
+npm run cli -- project set-blockly temp/project.json --xml-file temp/workspace.xml --generated-code-file temp/generated.cpp --use-blockly-code true
+npm run cli -- project block-summary temp/project.json
+
 # Update project/library.txt from a text file
 npm run cli -- project set-library-file temp/project.json --input temp/libs.txt
 ```
@@ -98,6 +101,15 @@ npm run cli -- sim screenshot temp/project.json --duration-ms 1200 --output out/
 # Inspect input/output component automation templates
 npm run cli -- sim capabilities temp/project.json --json
 
+# Probe one component with diffed before/after state + pin/display behavior
+npm run cli -- sim probe temp/project.json --component-id ldr1 --event SET_ATTR --key lux --value 700 --assertions-file temp/assertions.yaml
+
+# Display-focused normalized state capture for AI agents
+npm run cli -- sim display temp/project.json --duration-ms 1500 --output out/display.json
+
+# Multi-step scenario with timed inputs and assertions
+npm run cli -- sim scenario temp/project.json --scenario scenarios/sensor-check.yaml --output out/scenario-report.json
+
 # Print simulation-focused summary and validation
 npm run cli -- sim summary temp/project.json
 ```
@@ -126,7 +138,16 @@ npm run cli -- mcp serve
 npm run cli -- mcp serve --auth-token local-dev-token
 ```
 
-MCP tools now include `sim_execute`, `sim_trace`, and `sim_inspect` with support for debug/GDB trace capture (`debug_mode`, `include_trace`) and simulation console capture (`include_console`) without polluting stdio transport.
+MCP tools now include `sim_execute`, `sim_trace`, `sim_inspect`, `simulation_step`, and `simulation_assert` with support for debug/GDB trace capture (`debug_mode`, `include_trace`) and simulation console capture (`include_console`) without polluting stdio transport.
+
+Additional MCP lifecycle and diagnostics tools:
+- `project_open` (set active session from an existing project file)
+- `project_status` (active session state + summary)
+- `project_validate` (schema/reference validation for active session)
+- `component_catalog` (discover component capabilities/pins/onEvent/telemetry metadata)
+- `simulation_capabilities` (project-scoped observability and interaction affordances for AI agents)
+- `component_input_schema` (event templates + sensor profiles per component instance)
+- `wiring_validate` (dry-run endpoint/wire validation without project mutation)
 
 ### Library management
 
@@ -137,6 +158,40 @@ npm run cli -- lib install "Adafruit NeoPixel"
 npm run cli -- lib uninstall "Adafruit NeoPixel"
 npm run cli -- lib sync-project temp/project.json --dry-run
 ```
+
+### Advanced MCP testing + behavior reports
+
+```bash
+# MCP response contract coverage (positive + negative paths)
+npm run test:mcp:contracts
+
+# Validate block-coding project workflow through CLI
+npm run test:cli:block-coding
+
+# Deterministic scenario runner dry-run (YAML/JSON manifest parse + wiring diagnostics + report export)
+npm run test:mcp:scenario
+
+# Dry-run fixture coverage for display-heavy and sensor-heavy projects
+npm run test:mcp:scenario:display
+npm run test:mcp:scenario:sensor
+
+# Full runtime scenario execution (requires simulation dependencies/backend)
+npm run test:mcp:scenario:full
+
+# Override scenario/report paths
+node scripts/mcp-scenario-runner.mjs \
+  --scenario scenarios/pico-led-lifecycle.yaml \
+  --output-json temp/mcp-scenario-report.json \
+  --output-md temp/mcp-scenario-report.md \
+  --baseline temp/mcp-scenario-report-baseline.json
+```
+
+The scenario runner report includes:
+- per-component state timeline (`trace.componentTimeline`)
+- board pin activity timeline (`trace.boardPinTimeline`)
+- wire/connectivity diagnostics (`wiring`)
+- serial + telemetry + trace correlation (`serial`, `telemetry`, `trace`)
+- optional behavior-diff gate against a baseline report (`--baseline`)
 
 ### Interactive REPL
 
@@ -155,6 +210,14 @@ npm run cli -- repl
 - `sim interact` can inject component events for interactive parts (e.g. LDR, potentiometer, pushbutton).
 - `mcp serve` starts a local Model Context Protocol server over stdio, including simulation trace/inspect tools for remote automation.
 - Default backend URL is `http://localhost:5001/api` and can be overridden with `--backend-url`.
-=======
-# OpenHW-studio--cli
->>>>>>> origin/develop
+
+## MCP CLI completion checklist
+
+- [x] Project lifecycle tools: init/open/status/validate
+- [x] Component catalog/discovery with pin and capability metadata
+- [x] Dry-run wiring validation diagnostics before mutation
+- [x] Simulation execution, trace capture, and inspect/event injection
+- [x] Scenario-driven test runner with JSON/YAML manifests
+- [x] Unified report export in JSON + human-readable Markdown
+- [x] Contract tests for MCP tool response shape + negative cases
+- [x] Pico component matrix scripts for broad and per-component coverage

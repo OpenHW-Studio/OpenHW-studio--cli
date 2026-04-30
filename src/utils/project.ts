@@ -217,6 +217,9 @@ export function normalizeProject(rawProject: any): OpenHwProject {
     components,
     connections,
     code: asString(rawProject?.code, asString(rawProject?.userCode, '')),
+    blocklyXml: asString(rawProject?.blocklyXml, ''),
+    blocklyGeneratedCode: asString(rawProject?.blocklyGeneratedCode, ''),
+    useBlocklyCode: !!rawProject?.useBlocklyCode,
     projectFiles,
     openCodeTabs: Array.isArray(rawProject?.openCodeTabs)
       ? rawProject.openCodeTabs.map((id: any) => String(id)).filter(Boolean)
@@ -280,6 +283,9 @@ export function createProject(name: string, board: string): OpenHwProject {
     ],
     connections: [],
     code: defaultMainCode(boardKind === 'unknown' ? 'arduino_uno' : boardKind, boardId),
+    blocklyXml: '',
+    blocklyGeneratedCode: '',
+    useBlocklyCode: false,
     projectFiles: [],
     openCodeTabs: [],
     activeCodeFileId: '',
@@ -504,6 +510,8 @@ export function summarizeProject(project: OpenHwProject): Record<string, unknown
     connections: project.connections.length,
     boards: boards.map((b) => ({ id: b.id, type: b.type })),
     files: project.projectFiles.length,
+    useBlocklyCode: !!project.useBlocklyCode,
+    hasBlocklyXml: !!String(project.blocklyXml || '').trim(),
     activeCodeFileId: project.activeCodeFileId,
     exportedAt: project.exportedAt,
   };
@@ -582,9 +590,27 @@ export function getCodeForBoard(project: OpenHwProject, boardId: string): { sour
     throw new Error(`Board component not found: ${boardId}`);
   }
 
+  const envRaw = String((boardComp.attrs as any)?.env || '').trim().toLowerCase();
+  const preferPython =
+    envRaw === 'py'
+    || envRaw === 'python'
+    || envRaw === 'micropython'
+    || envRaw.startsWith('micropython')
+    || envRaw === 'cp'
+    || envRaw === 'circuitpy'
+    || envRaw === 'circuitpython'
+    || envRaw.startsWith('circuitpython');
+
   const boardFiles = project.projectFiles
     .filter((f) => String(f.path || '').startsWith(`project/${boardId}/`))
     .filter((f) => !isFileDisabled(f.path));
+
+  if (preferPython) {
+    const pyPreferred = boardFiles.find((f) => f.path.toLowerCase().endsWith('.py') && String(f.content || '').trim());
+    if (pyPreferred) {
+      return { source: pyPreferred.content || '', filePath: pyPreferred.path, isPython: true };
+    }
+  }
 
   const ino = boardFiles.find((f) => f.path.toLowerCase().endsWith('.ino') && String(f.content || '').trim());
   if (ino) {

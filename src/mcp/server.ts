@@ -10,9 +10,21 @@ import {
   loadProject,
   saveProject,
   summarizeProject,
+  validateProject,
 } from '../utils/project.js';
 import { relToCwd, resolveWorkspacePath } from '../utils/paths.js';
 import { startSimulation } from '../sim/session.js';
+import { getManifestInfo, getPinsForType, listManifestInfos } from '../utils/manifests.js';
+import {
+  type AssertionCheck,
+  buildProfileEvents,
+  componentInputSchemaForProject,
+  diffBoardPins,
+  diffComponentStates,
+  evaluateAssertions,
+  extractDisplayStates,
+  normalizeBoardPinStates,
+} from '../sim/agent-observability.js';
 
 export interface McpServerConfig {
   backendUrl: string;
@@ -380,6 +392,56 @@ async function requireActiveProject(session: ActiveProjectSession): Promise<{ pr
   };
 }
 
+function parseWireEndpoint(endpoint: string): { componentId: string; pinId: string } {
+  const [componentId, pinId] = String(endpoint || '').split(':');
+  if (!componentId || !pinId) {
+    throw new Error(`Invalid endpoint format: ${endpoint}. Expected <componentId>:<pinId>.`);
+  }
+  return { componentId, pinId };
+}
+
+async function validateConnectionInProject(project: OpenHwProject, from: string, to: string): Promise<{
+  from: string;
+  to: string;
+  valid: boolean;
+  issues: string[];
+}> {
+  const issues: string[] = [];
+  const endpoints = [from, to];
+
+  for (const endpoint of endpoints) {
+    let parsed: { componentId: string; pinId: string };
+    try {
+      parsed = parseWireEndpoint(endpoint);
+    } catch (error) {
+      const asError = error as { name?: string; code?: string; message?: string };
+      const errorName = String(asError?.name || 'Error');
+      const errorCode = String(asError?.code || '').trim();
+      const errorMessage = String(asError?.message || error || 'Unknown error');
+      issues.push(errorCode ? `${errorName}(${errorCode}): ${errorMessage}` : `${errorName}: ${errorMessage}`);
+      continue;
+    }
+
+    const component = project.components.find((entry) => entry.id === parsed.componentId) || null;
+    if (!component) {
+      issues.push(`Component not found for endpoint: ${endpoint}`);
+      continue;
+    }
+
+    const pins = await getPinsForType(component.type);
+    if (pins && pins.size > 0 && !pins.has(parsed.pinId)) {
+      issues.push(`Pin ${parsed.pinId} does not exist on component type ${component.type}.`);
+    }
+  }
+
+  return {
+    from,
+    to,
+    valid: issues.length === 0,
+    issues,
+  };
+}
+
 function buildInteractionEvent(event: unknown, value: unknown): unknown {
   if (event && typeof event === 'object' && !Array.isArray(event)) {
     return event;
@@ -401,6 +463,98 @@ function buildInteractionEvent(event: unknown, value: unknown): unknown {
     type: eventName,
     value: parseLooseValue(value),
   };
+}
+
+function buildCorrelationId(prefix: string): string {
+  const stamp = Date.now().toString(36);
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `${prefix}-${stamp}-${rand}`;
+}
+
+function normalizeInputEventsForStep(options: {
+  project: OpenHwProject;
+  durationMs: number;
+  inputs: Array<{
+    id?: string;
+    event?: unknown;
+    value?: unknown;
+    at_ms?: number;
+    profile?: string;
+  }>;
+}): Array<{ atMs: number; id: string; event: unknown; profile?: string }> {
+  const events: Array<{ atMs: number; id: string; event: unknown; profile?: string }> = [];
+
+  for (const input of options.inputs) {
+    const id = String(input?.id || '').trim();
+    if (!id) continue;
+    const component = options.project.components.find((entry) => entry.id === id) || null;
+    if (!component) continue;
+
+    const atMs = Math.max(0, Math.min(options.durationMs, Math.floor(Number(input?.at_ms || 0))));
+    const profile = String(input?.profile || '').trim();
+    if (profile) {
+      for (const profileEvent of buildProfileEvents(profile, component.type, options.durationMs)) {
+        events.push({
+          atMs: profileEvent.atMs,
+          id,
+          event: profileEvent.event,
+          profile,
+        });
+      }
+      continue;
+    }
+
+    events.push({
+      atMs,
+      id,
+      event: buildInteractionEvent(input?.event, input?.value),
+    });
+  }
+
+  return events.sort((a, b) => a.atMs - b.atMs);
+}
+
+function normalizeAssertionChecks(assertions: Array<Record<string, unknown>>): AssertionCheck[] {
+  const checks: AssertionCheck[] = [];
+  for (const entry of assertions) {
+    const type = String(entry?.type || '').trim();
+    if (type === 'display_contains') {
+      const text = String(entry?.text || '').trim();
+      if (!text) continue;
+      checks.push({
+        type,
+        component_id: String(entry?.component_id || '').trim() || undefined,
+        text,
+      });
+      continue;
+    }
+
+    if (type === 'component_status') {
+      const componentId = String(entry?.component_id || '').trim();
+      const status = String(entry?.status || '').trim();
+      if (!componentId) continue;
+      if (status !== 'ok' && status !== 'warn' && status !== 'error') continue;
+      checks.push({
+        type,
+        component_id: componentId,
+        status,
+      });
+      continue;
+    }
+
+    if (type === 'pin_state') {
+      const boardId = String(entry?.board_id || '').trim();
+      const pin = String(entry?.pin || '').trim();
+      if (!boardId || !pin) continue;
+      checks.push({
+        type,
+        board_id: boardId,
+        pin,
+        high: !!entry?.high,
+      });
+    }
+  }
+  return checks;
 }
 
 async function runSimulationForDuration(
@@ -461,9 +615,222 @@ export async function runMcpServer(config: McpServerConfig): Promise<void> {
   };
 
   const server = new McpServer({
-    name: 'openhw-studio-cli-danish',
+    name: 'openhw-studio-cli',
     version: '0.1.0',
   });
+
+  server.tool(
+    'project_open',
+    'Load an existing OpenHW project JSON and set it as active session project.',
+    {
+      file: z.string().min(1),
+      token: z.string().optional(),
+    },
+    async ({ file, token }) => {
+      assertToken(config, token);
+
+      const projectFile = resolveWorkspacePath(String(file));
+      const project = await loadProject(projectFile);
+      session.projectFile = projectFile;
+
+      return makeToolResult({
+        ok: true,
+        action: 'project_open',
+        file: relToCwd(projectFile),
+        summary: summarizeProject(project),
+      });
+    }
+  );
+
+  server.tool(
+    'project_status',
+    'Return current MCP active project session status.',
+    {
+      token: z.string().optional(),
+    },
+    async ({ token }) => {
+      assertToken(config, token);
+
+      if (!session.projectFile) {
+        return makeToolResult({
+          ok: true,
+          action: 'project_status',
+          active: false,
+          file: null,
+        });
+      }
+
+      const project = await loadProject(session.projectFile);
+      return makeToolResult({
+        ok: true,
+        action: 'project_status',
+        active: true,
+        file: relToCwd(session.projectFile),
+        summary: summarizeProject(project),
+      });
+    }
+  );
+
+  server.tool(
+    'project_validate',
+    'Validate active project schema and references.',
+    {
+      token: z.string().optional(),
+    },
+    async ({ token }) => {
+      assertToken(config, token);
+
+      const { project, projectFile } = await requireActiveProject(session);
+      const validation = await validateProject(project);
+      return makeToolResult({
+        ok: validation.valid,
+        action: 'project_validate',
+        file: relToCwd(projectFile),
+        ...validation,
+      });
+    }
+  );
+
+  server.tool(
+    'component_catalog',
+    'List known component manifest capabilities (pins, group, onEvent, telemetry keys).',
+    {
+      token: z.string().optional(),
+    },
+    async ({ token }) => {
+      assertToken(config, token);
+      const manifests = await listManifestInfos();
+      return makeToolResult({
+        ok: true,
+        action: 'component_catalog',
+        count: manifests.length,
+        components: manifests.map((entry) => ({
+          type: entry.type,
+          label: entry.label,
+          group: entry.group,
+          pins: entry.pins.map((pin) => pin.id),
+          hasOnEvent: entry.hasOnEvent,
+          telemetry: entry.telemetry || null,
+        })),
+      });
+    }
+  );
+
+  server.tool(
+    'wiring_validate',
+    'Validate one or more proposed wires against the active project without mutating it.',
+    {
+      from: z.string().optional(),
+      to: z.string().optional(),
+      wires: z.array(z.object({ from: z.string().min(1), to: z.string().min(1) })).optional(),
+      token: z.string().optional(),
+    },
+    async ({ from, to, wires, token }) => {
+      assertToken(config, token);
+
+      const { project, projectFile } = await requireActiveProject(session);
+      const plannedWires = Array.isArray(wires) && wires.length > 0
+        ? wires.map((entry) => ({ from: String(entry.from), to: String(entry.to) }))
+        : [{
+          from: String(from || ''),
+          to: String(to || ''),
+        }];
+
+      if (plannedWires.some((entry) => !entry.from || !entry.to)) {
+        throw new Error('wiring_validate requires either from/to fields or a non-empty wires[] array.');
+      }
+
+      const diagnostics = await Promise.all(
+        plannedWires.map((entry) => validateConnectionInProject(project, entry.from, entry.to))
+      );
+      const valid = diagnostics.every((entry) => entry.valid);
+
+      return makeToolResult({
+        ok: valid,
+        action: 'wiring_validate',
+        file: relToCwd(projectFile),
+        valid,
+        diagnostics,
+      });
+    }
+  );
+
+  server.tool(
+    'simulation_capabilities',
+    'Describe simulation observability/input/assertion capabilities for the active project.',
+    {
+      token: z.string().optional(),
+    },
+    async ({ token }) => {
+      assertToken(config, token);
+      const { project, projectFile } = await requireActiveProject(session);
+
+      const manifestByType = new Map<string, Awaited<ReturnType<typeof getManifestInfo>>>();
+      for (const component of project.components) {
+        if (!manifestByType.has(component.type)) {
+          manifestByType.set(component.type, await getManifestInfo(component.type));
+        }
+      }
+
+      const componentSchemas = componentInputSchemaForProject(project, manifestByType);
+      return makeToolResult({
+        ok: true,
+        action: 'simulation_capabilities',
+        file: relToCwd(projectFile),
+        tools: {
+          observability: ['sim_execute', 'sim_trace', 'sim_inspect'],
+          interaction: ['component_interact', 'simulation_step'],
+          assertions: ['simulation_assert'],
+          metadata: ['component_catalog', 'component_input_schema'],
+        },
+        project: {
+          boards: project.components.filter((entry) => /(arduino|esp32|stm32|rp2040|pico)/i.test(entry.type)).map((entry) => ({
+            id: entry.id,
+            type: entry.type,
+            label: entry.label || entry.id,
+          })),
+          interactiveComponents: componentSchemas.filter((entry) => entry.interactive).map((entry) => ({
+            id: entry.id,
+            type: entry.type,
+            role: entry.role,
+            profiles: entry.profiles.map((profile) => profile.name),
+          })),
+        },
+      });
+    }
+  );
+
+  server.tool(
+    'component_input_schema',
+    'Return supported input payload templates, profiles, and event hints per project component.',
+    {
+      id: z.string().optional(),
+      token: z.string().optional(),
+    },
+    async ({ id, token }) => {
+      assertToken(config, token);
+      const { project, projectFile } = await requireActiveProject(session);
+
+      const manifestByType = new Map<string, Awaited<ReturnType<typeof getManifestInfo>>>();
+      for (const component of project.components) {
+        if (!manifestByType.has(component.type)) {
+          manifestByType.set(component.type, await getManifestInfo(component.type));
+        }
+      }
+
+      const allSchemas = componentInputSchemaForProject(project, manifestByType);
+      const componentId = String(id || '').trim();
+      const filtered = componentId ? allSchemas.filter((entry) => entry.id === componentId) : allSchemas;
+
+      return makeToolResult({
+        ok: filtered.length > 0 || !componentId,
+        action: 'component_input_schema',
+        file: relToCwd(projectFile),
+        count: filtered.length,
+        components: filtered,
+      });
+    }
+  );
 
   server.tool(
     'project_init',
@@ -764,6 +1131,219 @@ export async function runMcpServer(config: McpServerConfig): Promise<void> {
   );
 
   server.tool(
+    'simulation_step',
+    'Run deterministic step-based simulation control with optional timed inputs and bounded trace capture.',
+    {
+      steps: z.number().int().positive().max(500).optional(),
+      step_ms: z.number().int().positive().max(60000).optional(),
+      board_id: z.string().optional(),
+      all_boards: z.boolean().optional(),
+      include_trace: z.boolean().optional(),
+      include_console: z.boolean().optional(),
+      include_state: z.boolean().optional(),
+      include_serial_text: z.boolean().optional(),
+      include_diff: z.boolean().optional(),
+      include_display: z.boolean().optional(),
+      include_pin_state: z.boolean().optional(),
+      max_events: z.number().int().positive().max(5000).optional(),
+      max_console_chars: z.number().int().positive().max(250000).optional(),
+      max_serial_chars: z.number().int().positive().max(10000).optional(),
+      inputs: z.array(z.object({
+        id: z.string().optional(),
+        event: z.any().optional(),
+        value: z.any().optional(),
+        at_ms: z.number().int().nonnegative().optional(),
+        profile: z.string().optional(),
+      })).optional(),
+      token: z.string().optional(),
+    },
+    async ({
+      steps,
+      step_ms,
+      board_id,
+      all_boards,
+      include_trace,
+      include_console,
+      include_state,
+      include_serial_text,
+      include_diff,
+      include_display,
+      include_pin_state,
+      max_events,
+      max_console_chars,
+      max_serial_chars,
+      inputs,
+      token,
+    }) => {
+      assertToken(config, token);
+      const { project, projectFile } = await requireActiveProject(session);
+      const totalSteps = clampPositiveInt(steps, 8, 1, 500);
+      const stepMs = clampPositiveInt(step_ms, 120, 1, 60000);
+      const durationMs = totalSteps * stepMs;
+      const includeTrace = !!include_trace;
+      const includeConsole = !!include_console;
+
+      const runOptions: SimulationRunOptions = {
+        backendUrl: config.backendUrl,
+        boardId: board_id,
+        allBoards: !!all_boards,
+        durationMs: 0,
+        debugMode: includeTrace ? 'json' : 'off',
+        telemetryMode: 'off',
+      };
+
+      const runtimeCapture = createRuntimeCapture({
+        includeTrace,
+        includeConsole,
+        maxEvents: clampPositiveInt(max_events, 400, 1, 5000),
+        maxConsoleChars: clampPositiveInt(max_console_chars, 10000, 256, 250000),
+        traceEventTypes: [],
+        traceBuild: {
+          includeState: !!include_state,
+          includeSerialText: !!include_serial_text,
+          maxSerialChars: clampPositiveInt(max_serial_chars, 120, 16, 10000),
+          componentId: null,
+        },
+      });
+
+      const scheduledInputs = normalizeInputEventsForStep({
+        project,
+        durationMs,
+        inputs: Array.isArray(inputs) ? inputs : [],
+      });
+
+      const controller = await startSimulation(project, runOptions, {
+        suppressConsoleOutput: true,
+        onEvent: runtimeCapture.onEvent,
+      });
+
+      const snapshots: Array<{ step: number; tMs: number; boards: number; components: number }> = [];
+      let elapsedMs = 0;
+      let inputCursor = 0;
+      for (let step = 1; step <= totalSteps; step += 1) {
+        const nextElapsed = step * stepMs;
+        while (inputCursor < scheduledInputs.length && scheduledInputs[inputCursor].atMs <= nextElapsed) {
+          const inputEvent = scheduledInputs[inputCursor];
+          controller.sendComponentEvent(inputEvent.id, inputEvent.event);
+          inputCursor += 1;
+        }
+        await sleep(stepMs);
+        elapsedMs = nextElapsed;
+        const snapshot = controller.getSnapshot();
+        snapshots.push({
+          step,
+          tMs: elapsedMs,
+          boards: snapshot.boards.length,
+          components: snapshot.components.length,
+        });
+      }
+
+      controller.stop();
+
+      const result = controller.getResult();
+      const telemetry = controller.getTelemetryReport();
+      const snapshot = controller.getSnapshot();
+      const captured = runtimeCapture.flush();
+      const displays = extractDisplayStates(snapshot, telemetry);
+
+      return makeToolResult({
+        ok: true,
+        action: 'simulation_step',
+        file: relToCwd(projectFile),
+        run: {
+          steps: totalSteps,
+          stepMs,
+          elapsedMs,
+          boardId: board_id || null,
+          allBoards: !!all_boards,
+        },
+        inputs: scheduledInputs,
+        snapshots,
+        pinState: normalizeBoardPinStates(snapshot),
+        displays,
+        result,
+        telemetry,
+        trace: includeTrace ? captured.trace : undefined,
+        traceSummary: includeTrace
+          ? {
+              capturedEvents: captured.trace.length,
+              droppedEvents: captured.droppedTraceEvents,
+            }
+          : undefined,
+        console: includeConsole
+          ? {
+              text: captured.consoleText,
+              length: captured.consoleText.length,
+            }
+          : undefined,
+      });
+    }
+  );
+
+  server.tool(
+    'simulation_assert',
+    'Run a short simulation and evaluate assertion checks against telemetry, display state, and pin values.',
+    {
+      ms: z.number().int().positive().optional(),
+      board_id: z.string().optional(),
+      all_boards: z.boolean().optional(),
+      assertions: z.array(z.object({
+        type: z.string(),
+        component_id: z.string().optional(),
+        board_id: z.string().optional(),
+        pin: z.string().optional(),
+        text: z.string().optional(),
+        status: z.enum(['ok', 'warn', 'error']).optional(),
+        high: z.boolean().optional(),
+      })),
+      token: z.string().optional(),
+    },
+    async ({ ms, board_id, all_boards, assertions, token }) => {
+      assertToken(config, token);
+      const { project, projectFile } = await requireActiveProject(session);
+      const durationMs = clampPositiveInt(ms, 1200, 1, 1200000);
+
+      const runOptions: SimulationRunOptions = {
+        backendUrl: config.backendUrl,
+        boardId: board_id,
+        allBoards: !!all_boards,
+        durationMs,
+        debugMode: 'off',
+        telemetryMode: 'off',
+      };
+
+      const { result, telemetry } = await runSimulationForDuration(project, runOptions, true);
+      const controller = await startSimulation(project, {
+        ...runOptions,
+        durationMs: 1,
+      }, {
+        suppressConsoleOutput: true,
+      });
+      await sleep(1);
+      controller.stop();
+      const snapshot = controller.getSnapshot();
+
+      const displays = extractDisplayStates(snapshot, telemetry);
+      const checks = normalizeAssertionChecks(assertions as Array<Record<string, unknown>>);
+      const assertionResult = evaluateAssertions({
+        checks,
+        displays,
+        telemetry,
+        snapshot,
+      });
+
+      return makeToolResult({
+        ok: assertionResult.ok,
+        action: 'simulation_assert',
+        file: relToCwd(projectFile),
+        durationMs,
+        result,
+        assertions: assertionResult,
+      });
+    }
+  );
+
+  server.tool(
     'sim_inspect',
     'Inspect runtime board/component telemetry for the active project with optional event injection.',
     {
@@ -778,6 +1358,9 @@ export async function runMcpServer(config: McpServerConfig): Promise<void> {
       include_console: z.boolean().optional(),
       include_state: z.boolean().optional(),
       include_serial_text: z.boolean().optional(),
+      include_diff: z.boolean().optional(),
+      include_display: z.boolean().optional(),
+      include_pin_state: z.boolean().optional(),
       max_events: z.number().int().positive().max(5000).optional(),
       max_console_chars: z.number().int().positive().max(250000).optional(),
       max_serial_chars: z.number().int().positive().max(10000).optional(),
@@ -796,6 +1379,9 @@ export async function runMcpServer(config: McpServerConfig): Promise<void> {
       include_console,
       include_state,
       include_serial_text,
+      include_diff,
+      include_display,
+      include_pin_state,
       max_events,
       max_console_chars,
       max_serial_chars,
@@ -840,6 +1426,9 @@ export async function runMcpServer(config: McpServerConfig): Promise<void> {
       let delivered = false;
       let eventPayload: unknown = null;
       let eventAtMs = 0;
+      let beforeSnapshot = controller.getSnapshot();
+      let beforeTelemetry = controller.getTelemetryReport();
+      let correlationId = '';
 
       if (injectEvent) {
         const targetComponentId = componentId;
@@ -854,6 +1443,9 @@ export async function runMcpServer(config: McpServerConfig): Promise<void> {
           await sleep(eventAtMs);
         }
 
+        beforeSnapshot = controller.getSnapshot();
+        beforeTelemetry = controller.getTelemetryReport();
+        correlationId = buildCorrelationId('inspect');
         delivered = controller.sendComponentEvent(targetComponentId, eventPayload);
       }
 
@@ -868,6 +1460,7 @@ export async function runMcpServer(config: McpServerConfig): Promise<void> {
       const telemetry = controller.getTelemetryReport();
       const snapshot = controller.getSnapshot();
       const captured = runtimeCapture.flush();
+      const displays = include_display === false ? [] : extractDisplayStates(snapshot, telemetry);
 
       const componentTelemetry = componentId
         ? telemetry.components.find((component) => component.id === componentId) || null
@@ -905,11 +1498,36 @@ export async function runMcpServer(config: McpServerConfig): Promise<void> {
           event: eventPayload,
           atMs: eventAtMs,
           delivered,
+          correlationId: correlationId || null,
+        };
+      }
+
+      if (include_pin_state !== false) {
+        payload.pinState = normalizeBoardPinStates(snapshot);
+      }
+
+      if (include_display !== false) {
+        payload.displays = displays;
+      }
+
+      if (injectEvent && include_diff !== false) {
+        payload.diff = {
+          boardPins: diffBoardPins(beforeSnapshot, snapshot),
+          components: diffComponentStates(beforeSnapshot, snapshot, componentId || null),
+          displays: {
+            before: extractDisplayStates(beforeSnapshot, beforeTelemetry),
+            after: displays,
+          },
         };
       }
 
       if (include_trace) {
         payload.trace = captured.trace;
+        if (correlationId) {
+          payload.correlatedTrace = captured.trace
+            .filter((entry) => entry.tMs >= eventAtMs)
+            .map((entry) => ({ ...entry, correlationId }));
+        }
         payload.traceSummary = {
           capturedEvents: captured.trace.length,
           droppedEvents: captured.droppedTraceEvents,

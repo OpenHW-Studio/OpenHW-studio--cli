@@ -1,0 +1,551 @@
+import type { OpenHwProject, SimulationSnapshot, SimulationTelemetryReport } from '../types.js';
+import type { ManifestInfo } from '../utils/manifests.js';
+
+export type ComponentInputTemplate = string | Record<string, unknown>;
+
+export type ComponentInputSchema = {
+  id: string;
+  type: string;
+  label: string;
+  group: string;
+  role: 'board' | 'input' | 'output' | 'other';
+  interactive: boolean;
+  hasOnEvent: boolean;
+  contract: {
+    eventTypes: string[];
+    controlKeys: string[];
+    contextMenuDuringRun: boolean;
+    contextMenuOnlyDuringRun: boolean;
+  };
+  templates: ComponentInputTemplate[];
+  profiles: Array<{
+    name: string;
+    description: string;
+    defaultDurationMs: number;
+    example: Array<{ atMs: number; event: unknown }>;
+  }>;
+};
+
+export type DisplayStateView = {
+  id: string;
+  type: string;
+  label: string;
+  text: string | null;
+  value: number | string | null;
+  segments: unknown;
+  pixels: unknown;
+  rawState: Record<string, unknown>;
+};
+
+export type BoardPinState = {
+  boardId: string;
+  type: string;
+  pins: Array<{ pin: string; high: boolean }>;
+};
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+export function classifyRole(type: string, group: string): 'board' | 'input' | 'output' | 'other' {
+  if (/(arduino|esp32|stm32|rp2040|pico)/i.test(type)) return 'board';
+  const g = String(group || '').toLowerCase();
+  if (/(output|display|actuator|memory)/.test(g)) return 'output';
+  if (/(sensor|input|basic|communication|logic)/.test(g)) return 'input';
+  return 'other';
+}
+
+function camelizeLowerUnderscore(value: string): string {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return '';
+  const chunks = normalized.split(/[_\s-]+/).filter(Boolean);
+  if (chunks.length === 0) return '';
+  return `${chunks[0]}${chunks.slice(1).map((entry) => entry.charAt(0).toUpperCase() + entry.slice(1)).join('')}`;
+}
+
+function hasTemplateType(templates: ComponentInputTemplate[], type: string): boolean {
+  const wanted = String(type || '').trim();
+  if (!wanted) return false;
+  return templates.some((entry) => {
+    if (typeof entry === 'string') return entry === wanted;
+    if (!entry || typeof entry !== 'object') return false;
+    return String((entry as Record<string, unknown>).type || '').trim() === wanted;
+  });
+}
+
+function synthesizeTemplateForEventType(eventType: string, manifest: ManifestInfo): ComponentInputTemplate {
+  if (eventType === 'press' || eventType === 'release' || eventType === 'rotate-cw' || eventType === 'rotate-ccw') {
+    return eventType;
+  }
+
+  if (eventType === 'move') {
+    return { type: 'move', x: 0.5, y: 0.5 };
+  }
+
+  if (eventType === 'input') {
+    return { type: 'input', value: manifest.attrs?.value?.default ?? 50 };
+  }
+
+  if (eventType === 'SD_MOUNT' || eventType === 'MOUNT') {
+    return { type: eventType };
+  }
+  if (eventType === 'SD_UNMOUNT' || eventType === 'UNMOUNT' || eventType === 'EJECT') {
+    return { type: eventType };
+  }
+  if (eventType === 'SD_FORMAT' || eventType === 'FORMAT') {
+    return { type: eventType };
+  }
+  if (eventType === 'SD_WRITE_FILE' || eventType === 'WRITE_FILE') {
+    return { type: eventType, path: '/LOG.TXT', data: '' };
+  }
+  if (eventType === 'SD_READ_FILE' || eventType === 'READ_FILE') {
+    return { type: eventType, path: '/README.TXT' };
+  }
+  if (eventType === 'SD_DELETE_FILE' || eventType === 'DELETE_FILE') {
+    return { type: eventType, path: '/README.TXT' };
+  }
+
+  if (/^SET_[A-Z0-9_]+$/.test(eventType)) {
+    const normalized = camelizeLowerUnderscore(eventType.replace(/^SET_/, ''));
+    const attrKey = Object.keys(manifest.attrs || {}).find((key) => key.toLowerCase() === normalized.toLowerCase());
+    return {
+      type: eventType,
+      value: attrKey ? (manifest.attrs?.[attrKey]?.default ?? 0) : 0,
+    };
+  }
+
+  return { type: eventType };
+}
+
+function appendComponentSpecificTemplates(templates: ComponentInputTemplate[], manifest: ManifestInfo): void {
+  const type = String(manifest.type || '').toLowerCase();
+
+  if (type.includes('membrane-keypad')) {
+    const keypadKeys = ['1', '2', '3', 'A', '4', '5', '6', 'B', '7', '8', '9', 'C', '*', '0', '#', 'D'];
+    for (const key of keypadKeys) {
+      const eventName = `press:${key}`;
+      if (!templates.includes(eventName)) templates.push(eventName);
+    }
+    if (!templates.includes('release')) templates.push('release');
+    return;
+  }
+
+  if (type.includes('wokwi-sd-card')) {
+    const sdTemplates: ComponentInputTemplate[] = [
+      { type: 'SD_MOUNT' },
+      { type: 'SD_UNMOUNT' },
+      { type: 'SD_FORMAT' },
+      { type: 'SD_WRITE_FILE', path: '/LOG.TXT', data: '' },
+      { type: 'SD_READ_FILE', path: '/README.TXT' },
+      { type: 'SD_DELETE_FILE', path: '/README.TXT' },
+    ];
+    for (const entry of sdTemplates) {
+      const key = JSON.stringify(entry);
+      if (!templates.some((existing) => JSON.stringify(existing) === key)) {
+        templates.push(entry);
+      }
+    }
+  }
+}
+
+function templatesFromManifestContract(manifest: ManifestInfo | null): ComponentInputTemplate[] {
+  if (!manifest) return [];
+  const templates: ComponentInputTemplate[] = [];
+  const eventTypes = manifest.interaction?.eventTypes || [];
+  const controlKeys = manifest.interaction?.controlKeys || [];
+
+  for (const template of manifest.interaction?.uiEventTemplates || []) {
+    templates.push(template);
+  }
+
+  if (eventTypes.includes('SET_ATTR')) {
+    const keys = controlKeys.length > 0 ? controlKeys : Object.keys(manifest.attrs || {});
+    for (const key of keys) {
+      templates.push({
+        type: 'SET_ATTR',
+        key,
+        value: manifest.attrs?.[key]?.default ?? 0,
+      });
+    }
+  }
+
+  for (const eventType of eventTypes) {
+    if (!eventType || eventType === 'SET_ATTR') continue;
+    if (hasTemplateType(templates, eventType)) continue;
+    templates.push(synthesizeTemplateForEventType(eventType, manifest));
+  }
+
+  appendComponentSpecificTemplates(templates, manifest);
+
+  const dedup = new Set<string>();
+  return templates.filter((entry) => {
+    const key = JSON.stringify(entry);
+    if (dedup.has(key)) return false;
+    dedup.add(key);
+    return true;
+  });
+}
+
+export function interactionTemplatesForType(type: string, manifest?: ManifestInfo | null): ComponentInputTemplate[] {
+  const manifestTemplates = templatesFromManifestContract(manifest || null);
+  if (manifestTemplates.length > 0) {
+    return manifestTemplates;
+  }
+
+  const t = String(type || '').toLowerCase();
+
+  if (t.includes('pushbutton')) return ['press', 'release'];
+  if (t.includes('potentiometer') || t.includes('slide-potentiometer')) {
+    return [{ type: 'input', value: 0 }, { type: 'input', value: 50 }, { type: 'input', value: 100 }];
+  }
+  if (t.includes('ldr')) {
+    return [
+      { type: 'SET_ATTR', key: 'lux', value: 100 },
+      { type: 'SET_ATTR', key: 'lux', value: 800 },
+      { type: 'SET_ATTR', key: 'threshold', value: 500 },
+    ];
+  }
+  if (t.includes('max30102')) {
+    return [{ type: 'SET_RED_LED', value: 24 }, { type: 'SET_IR_LED', value: 24 }];
+  }
+  if (t.includes('dht')) {
+    return [
+      { type: 'SET_ATTR', key: 'temperature', value: 24 },
+      { type: 'SET_ATTR', key: 'humidity', value: 60 },
+    ];
+  }
+  return [{ type: 'input', value: 50 }, { type: 'SET_ATTR', key: 'value', value: 50 }];
+}
+
+export function sensorProfilesForType(type: string): ComponentInputSchema['profiles'] {
+  const t = String(type || '').toLowerCase();
+
+  if (t.includes('pushbutton')) {
+    return [
+      {
+        name: 'button_bounce',
+        description: 'Press/release burst that simulates switch bounce.',
+        defaultDurationMs: 250,
+        example: [
+          { atMs: 10, event: 'press' },
+          { atMs: 40, event: 'release' },
+          { atMs: 65, event: 'press' },
+          { atMs: 95, event: 'release' },
+          { atMs: 130, event: 'press' },
+        ],
+      },
+    ];
+  }
+
+  if (t.includes('potentiometer')) {
+    return [
+      {
+        name: 'pot_ramp',
+        description: 'Sweep potentiometer input from low to high.',
+        defaultDurationMs: 900,
+        example: [
+          { atMs: 50, event: { type: 'input', value: 0 } },
+          { atMs: 350, event: { type: 'input', value: 50 } },
+          { atMs: 700, event: { type: 'input', value: 100 } },
+        ],
+      },
+    ];
+  }
+
+  if (t.includes('ldr') || t.includes('light')) {
+    return [
+      {
+        name: 'light_sweep',
+        description: 'Change light intensity from dark to bright.',
+        defaultDurationMs: 1000,
+        example: [
+          { atMs: 50, event: { type: 'SET_ATTR', key: 'lux', value: 80 } },
+          { atMs: 450, event: { type: 'SET_ATTR', key: 'lux', value: 450 } },
+          { atMs: 850, event: { type: 'SET_ATTR', key: 'lux', value: 900 } },
+        ],
+      },
+      {
+        name: 'light_noise',
+        description: 'Inject noisy light readings around a threshold.',
+        defaultDurationMs: 1000,
+        example: [
+          { atMs: 100, event: { type: 'SET_ATTR', key: 'lux', value: 480 } },
+          { atMs: 240, event: { type: 'SET_ATTR', key: 'lux', value: 510 } },
+          { atMs: 420, event: { type: 'SET_ATTR', key: 'lux', value: 495 } },
+          { atMs: 610, event: { type: 'SET_ATTR', key: 'lux', value: 520 } },
+        ],
+      },
+    ];
+  }
+
+  if (t.includes('max30102')) {
+    return [
+      {
+        name: 'max30102_led_sweep',
+        description: 'Sweep MAX30102 red/IR LED drive currents via component onEvent controls.',
+        defaultDurationMs: 1200,
+        example: [
+          { atMs: 100, event: { type: 'SET_RED_LED', value: 32 } },
+          { atMs: 500, event: { type: 'SET_IR_LED', value: 40 } },
+          { atMs: 900, event: { type: 'SET_RED_LED', value: 64 } },
+        ],
+      },
+      {
+        name: 'heart_rate_ramp',
+        description: 'Backward-compatible alias of max30102_led_sweep.',
+        defaultDurationMs: 1200,
+        example: [
+          { atMs: 100, event: { type: 'SET_RED_LED', value: 32 } },
+          { atMs: 500, event: { type: 'SET_IR_LED', value: 40 } },
+          { atMs: 900, event: { type: 'SET_RED_LED', value: 64 } },
+        ],
+      },
+    ];
+  }
+
+  return [];
+}
+
+export function componentInputSchemaForProject(
+  project: OpenHwProject,
+  manifestByType: Map<string, ManifestInfo | null>
+): ComponentInputSchema[] {
+  return project.components.map((component) => {
+    const manifest = manifestByType.get(component.type) || null;
+    const group = manifest?.group || 'Other';
+    const role = classifyRole(component.type, group);
+    const templates = interactionTemplatesForType(component.type, manifest);
+    const profiles = sensorProfilesForType(component.type);
+    const eventTypes = manifest?.interaction?.eventTypes || [];
+    const controlKeys = manifest?.interaction?.controlKeys || [];
+
+    return {
+      id: component.id,
+      type: component.type,
+      label: String(component.label || component.id),
+      group,
+      role,
+      interactive: !!manifest?.hasOnEvent || templates.length > 0 || eventTypes.length > 0,
+      hasOnEvent: !!manifest?.hasOnEvent,
+      contract: {
+        eventTypes,
+        controlKeys,
+        contextMenuDuringRun: !!manifest?.interaction?.contextMenuDuringRun,
+        contextMenuOnlyDuringRun: !!manifest?.interaction?.contextMenuOnlyDuringRun,
+      },
+      templates,
+      profiles,
+    };
+  });
+}
+
+function looksLikeDisplay(type: string, state: Record<string, unknown>): boolean {
+  const t = String(type || '').toLowerCase();
+  if (/(display|oled|lcd|ssd1306|ili9341|max7219|7segment|segment|matrix|tm1637)/.test(t)) return true;
+  return ['text', 'segments', 'pixels', 'chars', 'buffer'].some((key) => Object.prototype.hasOwnProperty.call(state, key));
+}
+
+export function extractDisplayStates(
+  snapshot: SimulationSnapshot,
+  telemetry?: SimulationTelemetryReport | null
+): DisplayStateView[] {
+  const telemetryById = new Map(
+    Array.isArray(telemetry?.components)
+      ? telemetry!.components.map((entry) => [String(entry.id), entry])
+      : []
+  );
+
+  return snapshot.components
+    .filter((component) => looksLikeDisplay(component.type, component.state || {}))
+    .map((component) => {
+      const state = asRecord(component.state) || {};
+      const telemetryEntry = telemetryById.get(component.id);
+      const telemetryData = asRecord(telemetryEntry?.telemetryData);
+      let text: string | null = null;
+      if (typeof state.text === 'string') {
+        text = state.text;
+      } else if (typeof state.value === 'string') {
+        text = state.value;
+      } else if (typeof telemetryEntry?.outputSummary === 'string') {
+        text = telemetryEntry.outputSummary;
+      }
+
+      let numeric: number | null = null;
+      if (typeof state.value === 'number') {
+        numeric = state.value;
+      } else if (typeof state.number === 'number') {
+        numeric = state.number;
+      }
+
+      return {
+        id: component.id,
+        type: component.type,
+        label: component.label,
+        text,
+        value: numeric ?? (typeof state.value === 'string' ? state.value : null),
+        segments: state.segments ?? telemetryData?.segments ?? null,
+        pixels: state.pixels ?? telemetryData?.pixels ?? state.buffer ?? null,
+        rawState: state,
+      };
+    });
+}
+
+export function normalizeBoardPinStates(snapshot: SimulationSnapshot): BoardPinState[] {
+  return snapshot.boards.map((board) => {
+    const pins = snapshot.pinsByBoard[board.id] || {};
+    const normalizedPins = Object.keys(pins)
+      .sort((a, b) => a.localeCompare(b))
+      .map((pin) => ({ pin, high: !!pins[pin] }));
+
+    return {
+      boardId: board.id,
+      type: board.type,
+      pins: normalizedPins,
+    };
+  });
+}
+
+export function diffBoardPins(
+  before: SimulationSnapshot,
+  after: SimulationSnapshot
+): Array<{ boardId: string; changedPins: Array<{ pin: string; before: boolean; after: boolean }> }> {
+  const boardIds = new Set<string>([
+    ...Object.keys(before.pinsByBoard || {}),
+    ...Object.keys(after.pinsByBoard || {}),
+  ]);
+
+  const diffs: Array<{ boardId: string; changedPins: Array<{ pin: string; before: boolean; after: boolean }> }> = [];
+  for (const boardId of boardIds) {
+    const beforePins = before.pinsByBoard[boardId] || {};
+    const afterPins = after.pinsByBoard[boardId] || {};
+    const pinIds = new Set<string>([...Object.keys(beforePins), ...Object.keys(afterPins)]);
+    const changedPins: Array<{ pin: string; before: boolean; after: boolean }> = [];
+
+    for (const pinId of pinIds) {
+      const a = !!beforePins[pinId];
+      const b = !!afterPins[pinId];
+      if (a !== b) {
+        changedPins.push({ pin: pinId, before: a, after: b });
+      }
+    }
+
+    if (changedPins.length > 0) {
+      changedPins.sort((x, y) => x.pin.localeCompare(y.pin));
+      diffs.push({ boardId, changedPins });
+    }
+  }
+
+  return diffs.sort((a, b) => a.boardId.localeCompare(b.boardId));
+}
+
+export function diffComponentStates(
+  before: SimulationSnapshot,
+  after: SimulationSnapshot,
+  componentId?: string | null
+): Array<{ id: string; changedKeys: string[]; before: Record<string, unknown>; after: Record<string, unknown> }> {
+  const beforeById = new Map(before.components.map((entry) => [entry.id, asRecord(entry.state) || {}]));
+  const afterById = new Map(after.components.map((entry) => [entry.id, asRecord(entry.state) || {}]));
+
+  const ids = componentId
+    ? [componentId]
+    : [...new Set<string>([...beforeById.keys(), ...afterById.keys()])].sort((a, b) => a.localeCompare(b));
+
+  const diffs: Array<{ id: string; changedKeys: string[]; before: Record<string, unknown>; after: Record<string, unknown> }> = [];
+  const equals = (left: unknown, right: unknown): boolean => {
+    if (left === right) return true;
+    const leftIsObject = left !== null && typeof left === 'object';
+    const rightIsObject = right !== null && typeof right === 'object';
+    if (!leftIsObject || !rightIsObject) return false;
+    return JSON.stringify(left) === JSON.stringify(right);
+  };
+
+  for (const id of ids) {
+    const b = beforeById.get(id) || {};
+    const a = afterById.get(id) || {};
+    const keys = new Set<string>([...Object.keys(b), ...Object.keys(a)]);
+    const changed = [...keys]
+      .filter((key) => !equals((b as Record<string, unknown>)[key], (a as Record<string, unknown>)[key]))
+      .sort((x, y) => x.localeCompare(y));
+    if (changed.length > 0) {
+      diffs.push({ id, changedKeys: changed, before: b, after: a });
+    }
+  }
+
+  return diffs;
+}
+
+export function buildProfileEvents(
+  profile: string,
+  componentType: string,
+  durationMs: number
+): Array<{ atMs: number; event: unknown }> {
+  const profileSpec = sensorProfilesForType(componentType).find((entry) => entry.name === profile);
+  if (!profileSpec) return [];
+  const base = Math.max(1, profileSpec.defaultDurationMs);
+  const scale = Math.max(0.05, durationMs / base);
+  return profileSpec.example.map((entry) => ({
+    atMs: Math.max(0, Math.min(durationMs, Math.floor(entry.atMs * scale))),
+    event: entry.event,
+  }));
+}
+
+export type AssertionCheck =
+  | { type: 'display_contains'; component_id?: string; text: string }
+  | { type: 'component_status'; component_id: string; status: 'ok' | 'warn' | 'error' }
+  | { type: 'pin_state'; board_id: string; pin: string; high: boolean };
+
+export function evaluateAssertions(input: {
+  checks: AssertionCheck[];
+  displays: DisplayStateView[];
+  telemetry: SimulationTelemetryReport | null;
+  snapshot: SimulationSnapshot;
+}): {
+  ok: boolean;
+  total: number;
+  passed: number;
+  results: Array<{ check: AssertionCheck; ok: boolean; actual: unknown }>;
+} {
+  const results = input.checks.map((check) => {
+    if (check.type === 'display_contains') {
+      const displays = check.component_id
+        ? input.displays.filter((entry) => entry.id === check.component_id)
+        : input.displays;
+      const haystack = displays.map((entry) => String(entry.text || '')).join('\n');
+      const ok = haystack.toLowerCase().includes(String(check.text || '').toLowerCase());
+      return {
+        check,
+        ok,
+        actual: {
+          componentIds: displays.map((entry) => entry.id),
+          text: haystack,
+        },
+      };
+    }
+
+    if (check.type === 'component_status') {
+      const component = input.telemetry?.components.find((entry) => entry.id === check.component_id) || null;
+      const actual = component?.status || 'missing';
+      return {
+        check,
+        ok: actual === check.status,
+        actual,
+      };
+    }
+
+    const pinValue = !!(input.snapshot.pinsByBoard?.[check.board_id]?.[check.pin]);
+    return {
+      check,
+      ok: pinValue === !!check.high,
+      actual: pinValue,
+    };
+  });
+
+  const passed = results.filter((entry) => entry.ok).length;
+  return {
+    ok: passed === results.length,
+    total: results.length,
+    passed,
+    results,
+  };
+}
