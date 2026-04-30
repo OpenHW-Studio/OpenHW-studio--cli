@@ -615,7 +615,7 @@ export async function runMcpServer(config: McpServerConfig): Promise<void> {
   };
 
   const server = new McpServer({
-    name: 'openhw-studio-cli-danish',
+    name: 'openhw-studio-cli',
     version: '0.1.0',
   });
 

@@ -5,7 +5,7 @@ Terminal-first CLI for OpenHW Studio project management, headless simulation, se
 ## Install
 
 ```bash
-cd openhw-studio-cli-danish
+cd openhw-studio-cli
 npm install
 ```
 

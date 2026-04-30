@@ -1,7 +1,7 @@
 {
   "ok": true,
   "action": "sim.trace",
-  "file": "..\\openhw-studio-examples-danish\\examples\\json-example\\case11-pico-oled-ino.json",
+  "file": "..\\openhw-studio-examples\\examples\\json-example\\case11-pico-oled-ino.json",
   "options": {
     "boardId": null,
     "allBoards": false,
