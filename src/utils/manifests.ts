@@ -263,7 +263,7 @@ async function loadAllManifests(): Promise<void> {
           }
         : undefined;
 
-      MANIFEST_CACHE.set(type, {
+      const manifestInfo: ManifestInfo = {
         type,
         label: String(parsed.label || type),
         group: String(parsed.group || 'Other'),
@@ -281,7 +281,42 @@ async function loadAllManifests(): Promise<void> {
             }
           : undefined,
         telemetry,
-      });
+      };
+
+      const dirName = path.basename(path.dirname(manifestPath));
+      const aliases = new Set<string>();
+      aliases.add(type);
+      if (dirName) {
+        aliases.add(dirName);
+        aliases.add(dirName.toLowerCase());
+      }
+
+      if (type.startsWith('openhw-')) {
+        const suffix = type.slice('openhw-'.length);
+        aliases.add(`wokwi-${suffix}`);
+        aliases.add(suffix);
+      } else if (type.startsWith('wokwi-')) {
+        const suffix = type.slice('wokwi-'.length);
+        aliases.add(`openhw-${suffix}`);
+        aliases.add(suffix);
+      }
+
+      if (type === 'openhw-pico' || type === 'openhw-raspberry-pi-pico') {
+        aliases.add('wokwi-raspberry-pi-pico');
+        aliases.add('openhw-raspberry-pi-pico');
+        aliases.add('openhw-pico');
+      }
+      if (type === 'openhw-pico-w' || type === 'openhw-raspberry-pi-pico-w') {
+        aliases.add('wokwi-raspberry-pi-pico-w');
+        aliases.add('openhw-raspberry-pi-pico-w');
+        aliases.add('openhw-pico-w');
+      }
+
+      for (const alias of aliases) {
+        if (!MANIFEST_CACHE.has(alias) || alias === type) {
+          MANIFEST_CACHE.set(alias, manifestInfo);
+        }
+      }
     } catch {
       // Ignore malformed or missing manifests.
     }
@@ -308,10 +343,16 @@ export async function isKnownComponentType(type: string): Promise<boolean> {
 
 export async function listKnownComponentTypes(): Promise<string[]> {
   await loadAllManifests();
-  return [...MANIFEST_CACHE.keys()].sort((a, b) => a.localeCompare(b));
+  return [...new Set(Array.from(MANIFEST_CACHE.values()).map((info) => info.type))].sort((a, b) => a.localeCompare(b));
 }
 
 export async function listManifestInfos(): Promise<ManifestInfo[]> {
   await loadAllManifests();
-  return [...MANIFEST_CACHE.values()].sort((a, b) => a.type.localeCompare(b.type));
+  const unique = new Map<string, ManifestInfo>();
+  for (const info of MANIFEST_CACHE.values()) {
+    if (!unique.has(info.type)) {
+      unique.set(info.type, info);
+    }
+  }
+  return [...unique.values()].sort((a, b) => a.type.localeCompare(b.type));
 }

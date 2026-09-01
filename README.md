@@ -1,11 +1,18 @@
-# OpenHW Studio CLI
+# OpenHW Studio CLI & MCP Server
 
-Terminal-first CLI for OpenHW Studio project management, headless simulation, serial monitoring, and library management.
+Terminal-first CLI and Model Context Protocol (MCP) server for OpenHW Studio project management, circuit safety validation, headless electronics simulation, serial monitoring, and library management.
+
+## 📖 Detailed Documentation
+
+- 📚 [**Documentation Hub & Quickstart**](./docs/README.md)
+- 🤖 [**MCP Server Guide & 17 Tools Reference**](./docs/mcp-server.md)
+- 💻 [**CLI Command Reference**](./docs/cli-reference.md)
+- 🧪 [**Testing & Validation Guide**](./docs/testing-and-validation.md)
 
 ## Install
 
 ```bash
-cd openhw-studio-cli
+cd OpenHW-studio--cli
 npm install
 ```
 

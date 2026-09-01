@@ -282,7 +282,7 @@ export async function runAutoFix(project: OpenHwProject, issue: any, options: { 
     const result = applyCircuitFix(projectData, engineError, { appliedBy: options.appliedBy || 'cli', trackHistory: true });
 
     // Convert connections back to CLI format (comp.pin -> comp:pin)
-    const outConnections = (result.connections || []).map(w => ({
+    const outConnections = (result.connections || []).map((w: any) => ({
       from: String(w.from || '').replace('.', ':'),
       to: String(w.to || '').replace('.', ':'),
       color: w.color,

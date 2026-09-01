@@ -241,7 +241,7 @@ async function listComponentCatalog() {
         ? manifest.pins.map((pin) => String(pin?.id || '').trim()).filter(Boolean)
         : [];
       components.push({
-        type,
+        type: String(manifest?.type || type).trim(),
         pinNames,
       });
     } catch {
